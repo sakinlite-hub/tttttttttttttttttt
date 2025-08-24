@@ -176,23 +176,75 @@ supabaseClient.auth.onAuthStateChange(async (event, session) => {
 
 // User profile management
 async function loadUserProfile() {
+    if (!currentUser || !currentUser.id) {
+        console.error('Cannot load profile - no current user');
+        return;
+    }
+    
     try {
+        console.log('Loading user profile for:', currentUser.id);
+        
+        // Try the query with explicit headers
         const { data, error } = await supabaseClient
             .from('user_profiles')
             .select('*')
             .eq('id', currentUser.id)
-            .single();
+            .maybeSingle(); // Use maybeSingle instead of single to avoid errors when no data
             
-        if (error && error.code !== 'PGRST116') {
-            throw error;
+        console.log('Profile query result:', { data, error });
+        
+        if (error) {
+            console.error('Profile load error:', error);
+            
+            // Handle specific error cases
+            if (error.code === 'PGRST116') {
+                // No rows returned - profile doesn't exist yet
+                console.log('Profile does not exist yet');
+                return;
+            } else if (error.message?.includes('406') || error.status === 406) {
+                // 406 Not Acceptable error - likely RLS policy issue
+                console.error('RLS Policy or request format issue. Trying alternative approach...');
+                
+                // Try without single() to see if we can get any data
+                const { data: alternativeData, error: alternativeError } = await supabaseClient
+                    .from('user_profiles')
+                    .select('*')
+                    .eq('id', currentUser.id)
+                    .limit(1);
+                    
+                if (alternativeError) {
+                    console.error('Alternative query also failed:', alternativeError);
+                    throw new Error('Cannot access user profile. Please check database permissions.');
+                }
+                
+                if (alternativeData && alternativeData.length > 0) {
+                    currentUser.profile = alternativeData[0];
+                    await updateUserPresence(true);
+                    console.log('Profile loaded via alternative method');
+                    return;
+                }
+            } else {
+                throw error;
+            }
         }
         
         if (data) {
             currentUser.profile = data;
             await updateUserPresence(true);
+            console.log('Profile loaded successfully:', data.username);
+        } else {
+            console.log('No profile data found for user');
         }
+        
     } catch (error) {
         console.error('Profile load error:', error);
+        
+        // Show user-friendly error message
+        if (error.message?.includes('406') || error.message?.includes('Not Acceptable')) {
+            showError('Database access issue. Please refresh and try again.');
+        } else {
+            showError('Error loading profile: ' + error.message);
+        }
     }
 }
 
@@ -296,24 +348,45 @@ function percentage() {
 
 // Passcode verification
 async function checkPasscode(enteredCode) {
-    if (!currentUser || !currentUser.profile) {
+    console.log('=== CHECKING PASSCODE ===');
+    console.log('Entered code:', enteredCode);
+    console.log('Current user:', currentUser ? 'exists' : 'null');
+    console.log('User profile:', currentUser?.profile ? 'exists' : 'null');
+    
+    if (!currentUser) {
         showError('Please sign in first');
         return;
     }
     
+    // Try to load profile if it doesn't exist
+    if (!currentUser.profile) {
+        console.log('Profile not loaded, attempting to load...');
+        await loadUserProfile();
+        
+        if (!currentUser.profile) {
+            showError('User profile not found. Please set up your passcode.');
+            showPasscodeSetup();
+            return;
+        }
+    }
+    
     try {
         const hashedCode = await hashPasscode(enteredCode);
+        console.log('Hashed entered code:', hashedCode);
+        console.log('Stored passcode hash:', currentUser.profile.passcode_hash);
         
         if (hashedCode === currentUser.profile.passcode_hash) {
+            console.log('PASSCODE CORRECT - Transitioning to chat');
             // Correct passcode - transition to chat
             await transitionToChat();
         } else {
+            console.log('PASSCODE INCORRECT');
             // Wrong passcode - show error briefly
             showPasscodeError();
         }
     } catch (error) {
         console.error('Passcode check error:', error);
-        showError('Error checking passcode');
+        showError('Error checking passcode: ' + error.message);
     }
 }
 
@@ -879,20 +952,53 @@ async function markMessageAsRead(senderId) {
 
 // Message sending
 async function sendMessage() {
-    const messageText = document.getElementById('message-text');
-    const text = messageText.value.trim();
+    console.log('=== SENDING MESSAGE ===');
     
-    if (!text || !currentChatUser) {
-        console.log('Cannot send message - missing text or chat user');
+    const messageText = document.getElementById('message-text');
+    console.log('Message input element found:', !!messageText);
+    
+    if (!messageText) {
+        console.error('Message input element not found!');
+        showError('Message input not found. Please refresh the page.');
+        return;
+    }
+    
+    const text = messageText.value.trim();
+    console.log('Message text:', text);
+    console.log('Current chat user:', currentChatUser?.username || 'none');
+    console.log('Current user:', currentUser?.id || 'none');
+    
+    if (!text) {
+        console.log('Cannot send message - no text');
+        return;
+    }
+    
+    if (!currentChatUser) {
+        console.log('Cannot send message - no chat user selected');
+        showError('Please select a user to chat with');
+        return;
+    }
+    
+    if (!currentUser) {
+        console.log('Cannot send message - user not logged in');
+        showError('Please sign in to send messages');
         return;
     }
     
     // Disable send button to prevent double sending
     const sendBtn = document.getElementById('send-btn');
-    if (sendBtn) sendBtn.disabled = true;
+    if (sendBtn) {
+        sendBtn.disabled = true;
+        console.log('Send button disabled');
+    }
     
     try {
-        console.log('Sending message:', { text, to: currentChatUser.username });
+        console.log('Attempting to send message:', { 
+            text, 
+            from: currentUser.id, 
+            to: currentChatUser.id,
+            toUsername: currentChatUser.username 
+        });
         
         const { data, error } = await supabaseClient
             .from('messages')
@@ -905,20 +1011,30 @@ async function sendMessage() {
             .select();
             
         if (error) {
-            console.error('Send message error:', error);
+            console.error('Supabase error:', error);
             throw error;
         }
         
         console.log('Message sent successfully:', data);
         messageText.value = '';
         
+        // Focus back on input for mobile
+        if (isMobile) {
+            setTimeout(() => messageText.focus(), 100);
+        }
+        
     } catch (error) {
         console.error('Send message error:', error);
-        showError('Error sending message: ' + error.message);
+        showError('Error sending message: ' + (error.message || 'Unknown error'));
     } finally {
         // Re-enable send button
-        if (sendBtn) sendBtn.disabled = false;
+        if (sendBtn) {
+            sendBtn.disabled = false;
+            console.log('Send button re-enabled');
+        }
     }
+    
+    console.log('=== MESSAGE SEND COMPLETE ===');
 }
 
 // TikTok video sharing
@@ -1532,6 +1648,115 @@ window.testBackToUsers = function() {
         chatArea.classList.remove('active-mobile');
         console.log('Back navigation applied');
     }
+};
+
+// Test function for mobile messaging
+window.testMobileMessaging = function() {
+    console.log('=== TESTING MOBILE MESSAGING ===');
+    
+    const messageText = document.getElementById('message-text');
+    const sendBtn = document.getElementById('send-btn');
+    const chatMessages = document.getElementById('chat-messages');
+    const messageInput = document.getElementById('message-input-container');
+    
+    console.log('Elements check:', {
+        messageText: !!messageText,
+        sendBtn: !!sendBtn,
+        chatMessages: !!chatMessages,
+        messageInput: !!messageInput,
+        currentUser: !!currentUser,
+        currentChatUser: !!currentChatUser
+    });
+    
+    if (messageText) {
+        console.log('Message input visibility:', {
+            display: messageInput?.style.display,
+            visibility: getComputedStyle(messageText).visibility,
+            height: messageText.offsetHeight,
+            width: messageText.offsetWidth
+        });
+    }
+    
+    if (currentChatUser) {
+        console.log('Current chat user:', currentChatUser.username);
+    } else {
+        console.log('No chat user selected - this might be the problem!');
+    }
+    
+    // Try to send a test message
+    if (messageText && currentChatUser) {
+        messageText.value = 'Test message from mobile';
+        console.log('Test message set, attempting send...');
+        sendMessage();
+    }
+};
+
+// Diagnostic function for Supabase connection and RLS policies
+window.testSupabaseConnection = async function() {
+    console.log('=== TESTING SUPABASE CONNECTION ===');
+    
+    console.log('Current user:', currentUser ? {
+        id: currentUser.id,
+        email: currentUser.email,
+        hasProfile: !!currentUser.profile
+    } : 'null');
+    
+    try {
+        // Test 1: Check basic connection
+        console.log('Test 1: Basic Supabase connection...');
+        const { data: authData, error: authError } = await supabaseClient.auth.getUser();
+        console.log('Auth check:', { user: authData?.user?.id, error: authError });
+        
+        if (!authData?.user) {
+            console.log('❌ User not authenticated');
+            return;
+        }
+        
+        // Test 2: Try to query user_profiles table without filters
+        console.log('Test 2: Query user_profiles table (no filters)...');
+        const { data: allProfiles, error: allError } = await supabaseClient
+            .from('user_profiles')
+            .select('id, username, email')
+            .limit(1);
+        console.log('All profiles query:', { data: allProfiles, error: allError });
+        
+        // Test 3: Try to query own profile specifically
+        console.log('Test 3: Query own profile...');
+        const { data: ownProfile, error: ownError } = await supabaseClient
+            .from('user_profiles')
+            .select('*')
+            .eq('id', authData.user.id);
+        console.log('Own profile query:', { data: ownProfile, error: ownError });
+        
+        // Test 4: Check if profile exists in database
+        console.log('Test 4: Check profile existence...');
+        const { count, error: countError } = await supabaseClient
+            .from('user_profiles')
+            .select('*', { count: 'exact', head: true })
+            .eq('id', authData.user.id);
+        console.log('Profile count:', { count, error: countError });
+        
+        // Test 5: Try to create profile if it doesn't exist
+        if (count === 0) {
+            console.log('Test 5: Creating missing profile...');
+            const { data: createData, error: createError } = await supabaseClient
+                .from('user_profiles')
+                .insert({
+                    id: authData.user.id,
+                    email: authData.user.email,
+                    username: authData.user.email?.split('@')[0] || 'user',
+                    passcode_hash: '',
+                    is_online: false
+                })
+                .select();
+            console.log('Profile creation:', { data: createData, error: createError });
+        }
+        
+    } catch (error) {
+        console.error('Supabase connection test failed:', error);
+    }
+    
+    console.log('=== SUPABASE TEST COMPLETE ===');
 };
 
 // Force mobile mode and navigation (for testing)
